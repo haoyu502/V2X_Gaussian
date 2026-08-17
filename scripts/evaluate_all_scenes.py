@@ -42,17 +42,19 @@ def main():
     failures = []
     for index, model in enumerate(models, 1):
         method_dir = model / "test" / f"ours_{args.iteration}"
-        video = method_dir / "video_rgb.mp4"
+        test_video = method_dir / "video_rgb.mp4"
+        novel_video = model / "video" / f"ours_{args.iteration}" / "video_rgb.mp4"
         results = model / "results.json"
         eval_log = model / "evaluation.log"
         print(f"\n[{index}/{len(models)}] {model.name}", flush=True)
         try:
-            if args.force_render or not video.is_file() or not (method_dir / "renders").is_dir():
+            if args.force_render or not test_video.is_file() or not novel_video.is_file() \
+                    or not (method_dir / "renders").is_dir():
                 run([sys.executable, "render.py", "--model_path", str(model),
                      "--iteration", str(args.iteration), "--configs", args.config,
-                     "--skip_train", "--skip_video"], eval_log)
+                     "--skip_train"], eval_log)
             else:
-                print(f"[skip render] {video}")
+                print(f"[skip render] {test_video}; {novel_video}")
             if args.force_metrics or not results.is_file():
                 run([sys.executable, "metrics.py", "--model_paths", str(model)], eval_log)
             else:
@@ -71,8 +73,12 @@ def main():
         if method is None and result:
             method = next(iter(result.values()))
         if method:
-            rows.append({"scene": model.name, **method,
-                         "video": str(model / "test" / f"ours_{args.iteration}" / "video_rgb.mp4")})
+            rows.append({
+                "scene": model.name,
+                **method,
+                "test_video": str(model / "test" / f"ours_{args.iteration}" / "video_rgb.mp4"),
+                "novel_view_video": str(model / "video" / f"ours_{args.iteration}" / "video_rgb.mp4"),
+            })
 
     metric_keys = ["PSNR", "SSIM", "LPIPS-vgg", "LPIPS-alex", "MS-SSIM", "D-SSIM"]
     if rows:
@@ -81,16 +87,19 @@ def main():
         summary_csv = output_root / f"evaluation_summary_{args.suffix}.csv"
         summary_json.write_text(json.dumps({"scenes": rows, "average": average}, indent=2))
         with summary_csv.open("w", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=["scene", *metric_keys, "video"])
+            writer = csv.DictWriter(file, fieldnames=[
+                "scene", *metric_keys, "test_video", "novel_view_video"])
             writer.writeheader()
             writer.writerows(rows)
-            writer.writerow({"scene": "AVERAGE", **average, "video": ""})
+            writer.writerow({"scene": "AVERAGE", **average, "test_video": "", "novel_view_video": ""})
         print("\nFinal metrics")
         print(f"{'scene':45s} {'PSNR':>8s} {'SSIM':>8s} {'LPIPS':>8s}")
         for row in rows:
             print(f"{row['scene']:45s} {row['PSNR']:8.3f} {row['SSIM']:8.4f} {row['LPIPS-vgg']:8.4f}")
         print(f"{'AVERAGE':45s} {average['PSNR']:8.3f} {average['SSIM']:8.4f} {average['LPIPS-vgg']:8.4f}")
-        print(f"Summary: {summary_csv}\nVideos: each scene's test/ours_{args.iteration}/video_rgb.mp4")
+        print(f"Summary: {summary_csv}")
+        print(f"Test videos: each scene's test/ours_{args.iteration}/video_rgb.mp4")
+        print(f"Novel-view videos: each scene's video/ours_{args.iteration}/video_rgb.mp4")
     if failures:
         raise SystemExit("Failed scenes: " + ", ".join(name for name, _ in failures))
 

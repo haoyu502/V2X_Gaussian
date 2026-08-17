@@ -127,6 +127,17 @@ For four GPUs, change `CUDA_VISIBLE_DEVICES` to `0,1,2,3` and
 `arguments/multi_agents/v2x_gaussian_selective_gradient.py`; the 4090 baseline
 remains `arguments/multi_agents/v2x_gaussian_4090.py`.
 
+To preprocess, train every scene, render both evaluation and novel-view videos,
+and write the final CSV/JSON metrics with one command:
+
+```bash
+python scripts/run_full_pipeline.py --gpus 0,1
+```
+
+Use `--gpus 0,1,2,3` for four GPUs. Completed preprocessing, checkpoints,
+renders, and metrics are detected and skipped automatically when the command is
+restarted.
+
 
 
 ## Rendering

@@ -8,6 +8,7 @@ gpu_count="${NPROC_PER_NODE:-2}"
 config="${CONFIG:-arguments/multi_agents/v2x_gaussian_4090.py}"
 experiment_suffix="${EXP_SUFFIX:-2x4090}"
 base_port="${BASE_PORT:-6010}"
+final_iteration="${ITERATION:-20000}"
 
 cd "${repo_dir}"
 
@@ -31,8 +32,8 @@ for index in "${!scenes[@]}"; do
     scene_dir="${data_dir}/${scene}"
     experiment="${scene}_${experiment_suffix}"
     output_dir="${repo_dir}/output/${experiment}"
-    final_checkpoint="${output_dir}/chkpnt_fine_20000.pth"
-    final_point_cloud="${output_dir}/point_cloud/iteration_20000/point_cloud.ply"
+    final_checkpoint="${output_dir}/chkpnt_fine_${final_iteration}.pth"
+    final_point_cloud="${output_dir}/point_cloud/iteration_${final_iteration}/point_cloud.ply"
     port=$((base_port + index))
 
     if [[ -s "${final_checkpoint}" && -s "${final_point_cloud}" ]]; then
@@ -53,7 +54,7 @@ for index in "${!scenes[@]}"; do
         --expname "${experiment}" \
         --configs "${config}" \
         --port "${port}" \
-        --checkpoint_iterations 2500 5000 10000 15000 20000
+        --checkpoint_iterations 2500 5000 10000 15000 "${final_iteration}"
 done
 
 echo "All scenes completed."
