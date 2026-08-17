@@ -39,8 +39,8 @@ def main():
     parser.add_argument("--gpus", default="0,1", help="Comma-separated CUDA device IDs")
     parser.add_argument("--nproc-per-node", type=int, default=None,
                         help="Training processes; defaults to the number of GPU IDs")
-    parser.add_argument("--config", default="arguments/multi_agents/v2x_gaussian_occlusion.py")
-    parser.add_argument("--suffix", default="occlusion_2x4090",
+    parser.add_argument("--config", default="arguments/multi_agents/v2x_gaussian_adaptive_occlusion.py")
+    parser.add_argument("--suffix", default="adaptive_occlusion_2x4090",
                         help="Output name suffix and evaluation summary suffix")
     parser.add_argument("--iteration", type=int, default=None,
                         help="Expected final iteration; defaults to OptimizationParams.iterations in the config")

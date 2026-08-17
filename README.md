@@ -138,6 +138,17 @@ Use `--gpus 0,1,2,3` for four GPUs. Completed preprocessing, checkpoints,
 renders, and metrics are detected and skipped automatically when the command is
 restarted.
 
+The adaptive v2 profile is
+`arguments/multi_agents/v2x_gaussian_adaptive_occlusion.py`. It uses continuous
+visibility confidence, bounded collaborative gradients, and conservative guided
+densification. Its gradient-only ablation is
+`arguments/multi_agents/v2x_gaussian_adaptive_gradient.py`. Use a new suffix so
+v1 outputs remain untouched, for example:
+
+```bash
+python scripts/run_full_pipeline.py --gpus 0,1,4,5 --suffix adaptive_occlusion_4x4090
+```
+
 
 
 ## Rendering

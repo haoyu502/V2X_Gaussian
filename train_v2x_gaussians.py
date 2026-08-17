@@ -111,7 +111,7 @@ def build_visibility_field(local_visibility, local_radii, local_is_ego, opt):
     """Build synchronized ego/collaborator visibility and per-Gaussian weights."""
     if not distributed_enabled() or not opt.selective_collaboration:
         ones = torch.ones_like(local_radii, dtype=torch.float32)
-        return local_visibility, local_visibility, torch.zeros_like(local_visibility), ones
+        return local_visibility, local_visibility, torch.zeros_like(local_visibility), ones, ones
 
     ego_visibility = local_visibility.to(torch.int32) if local_is_ego else torch.zeros_like(
         local_visibility, dtype=torch.int32)
@@ -132,9 +132,23 @@ def build_visibility_field(local_visibility, local_radii, local_is_ego, opt):
     # The CUDA rasterizer may return integer radii. Collaboration weights must
     # remain floating point because overlap consistency is fractional.
     collaborator_weight = torch.zeros_like(local_radii, dtype=torch.float32)
-    collaborator_weight[blind_spots] = opt.collaboration_blind_weight
-    collaborator_weight[overlap] = opt.collaboration_overlap_weight * radius_consistency[overlap]
-    return ego_visibility, collaborator_visibility, blind_spots, collaborator_weight
+    if opt.adaptive_collaboration:
+        radius_scale = max(float(opt.visibility_radius_scale), 1e-6)
+        ego_confidence = ego_radii.float() / (ego_radii.float() + radius_scale)
+        collaborator_confidence = collaborator_radii.float() / (collaborator_radii.float() + radius_scale)
+        ego_confidence.mul_(ego_visibility.float())
+        collaborator_confidence.mul_(collaborator_visibility.float())
+        occlusion_score = (1.0 - ego_confidence) * collaborator_confidence
+        blind_weight = opt.collaboration_blind_weight * occlusion_score
+        overlap_weight = opt.collaboration_overlap_weight * occlusion_score * radius_consistency
+        collaborator_weight = torch.where(blind_spots, blind_weight, collaborator_weight)
+        collaborator_weight = torch.where(overlap, overlap_weight, collaborator_weight)
+        collaborator_weight.clamp_(0.0, opt.collaboration_max_weight)
+    else:
+        occlusion_score = blind_spots.float()
+        collaborator_weight[blind_spots] = opt.collaboration_blind_weight
+        collaborator_weight[overlap] = opt.collaboration_overlap_weight * radius_consistency[overlap]
+    return ego_visibility, collaborator_visibility, blind_spots, collaborator_weight, occlusion_score
 
 
 def sync_optimizer_gradients(optimizer, local_is_ego, local_visibility,
@@ -151,14 +165,23 @@ def sync_optimizer_gradients(optimizer, local_is_ego, local_visibility,
             gradient = parameter.grad.contiguous()
             if opt.selective_collaboration and group.get("name") in GAUSSIAN_PARAMETER_GROUPS \
                     and gradient.shape[0] == ego_visibility.shape[0]:
-                source_weight = ego_visibility.float() if local_is_ego else \
-                    collaborator_weight * local_visibility.float()
-                weight_shape = (source_weight.shape[0],) + (1,) * (gradient.ndim - 1)
-                gradient.mul_(source_weight.reshape(weight_shape))
-                denominator = source_weight.clone()
-                dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
-                dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
-                gradient.div_(denominator.clamp_min(1e-8).reshape(weight_shape))
+                point_shape = (ego_visibility.shape[0],) + (1,) * (gradient.ndim - 1)
+                if local_is_ego:
+                    ego_gradient = gradient * ego_visibility.float().reshape(point_shape)
+                    collaborator_gradient = torch.zeros_like(gradient)
+                    collaborator_count = torch.zeros_like(collaborator_weight)
+                else:
+                    ego_gradient = torch.zeros_like(gradient)
+                    local_collaborator = local_visibility.float()
+                    collaborator_gradient = gradient * (
+                        collaborator_weight * local_collaborator).reshape(point_shape)
+                    collaborator_count = torch.logical_and(
+                        local_visibility, collaborator_weight > 0).float()
+                dist.all_reduce(ego_gradient, op=dist.ReduceOp.SUM)
+                dist.all_reduce(collaborator_gradient, op=dist.ReduceOp.SUM)
+                dist.all_reduce(collaborator_count, op=dist.ReduceOp.SUM)
+                collaborator_gradient.div_(collaborator_count.clamp_min(1.0).reshape(point_shape))
+                gradient = ego_gradient + collaborator_gradient
             else:
                 if opt.selective_collaboration:
                     if local_is_ego:
@@ -186,13 +209,21 @@ def sync_densification_inputs(radii, visibility, viewspace_grad, local_is_ego,
         return radii, visibility, viewspace_grad
     dist.all_reduce(radii, op=dist.ReduceOp.MAX)
     if opt.selective_collaboration:
-        point_weight = ego_visibility.float() if local_is_ego else collaborator_weight * visibility.float()
-        weighted_grad = viewspace_grad * point_weight.unsqueeze(-1)
-        denominator = point_weight.clone()
-        dist.all_reduce(weighted_grad, op=dist.ReduceOp.SUM)
-        dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
-        weighted_grad.div_(denominator.clamp_min(1e-8).unsqueeze(-1))
-        return radii, torch.logical_or(ego_visibility, collaborator_visibility), weighted_grad
+        if local_is_ego:
+            ego_gradient = viewspace_grad * ego_visibility.float().unsqueeze(-1)
+            collaborator_gradient = torch.zeros_like(viewspace_grad)
+            collaborator_count = torch.zeros_like(collaborator_weight)
+        else:
+            ego_gradient = torch.zeros_like(viewspace_grad)
+            collaborator_gradient = viewspace_grad * (
+                collaborator_weight * visibility.float()).unsqueeze(-1)
+            collaborator_count = torch.logical_and(visibility, collaborator_weight > 0).float()
+        dist.all_reduce(ego_gradient, op=dist.ReduceOp.SUM)
+        dist.all_reduce(collaborator_gradient, op=dist.ReduceOp.SUM)
+        dist.all_reduce(collaborator_count, op=dist.ReduceOp.SUM)
+        collaborator_gradient.div_(collaborator_count.clamp_min(1.0).unsqueeze(-1))
+        combined_gradient = ego_gradient + collaborator_gradient
+        return radii, torch.logical_or(ego_visibility, collaborator_visibility), combined_gradient
     visibility_int = visibility.to(torch.int32)
     dist.all_reduce(visibility_int, op=dist.ReduceOp.MAX)
     dist.all_reduce(viewspace_grad, op=dist.ReduceOp.SUM)
@@ -498,15 +529,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         radii = torch.cat(radii_list, 0).max(dim=0).values
         visibility_filter = torch.cat(visibility_filter_list, 0).any(dim=0)
         viewspace_point_tensor_grad = torch.stack(viewspace_grads).sum(dim=0)
-        ego_visibility, collaborator_visibility, blind_spots, collaborator_weight = build_visibility_field(
-            visibility_filter, radii, local_is_ego, opt)
+        ego_visibility, collaborator_visibility, blind_spots, collaborator_weight, occlusion_score = \
+            build_visibility_field(
+                visibility_filter, radii, local_is_ego, opt)
         sync_optimizer_gradients(gaussians.optimizer, local_is_ego, visibility_filter,
                                  ego_visibility, collaborator_weight, opt)
         radii, visibility_filter, viewspace_point_tensor_grad = sync_densification_inputs(
             radii, visibility_filter, viewspace_point_tensor_grad, local_is_ego,
             ego_visibility, collaborator_visibility, collaborator_weight, opt)
         if opt.occlusion_guided_densification:
-            viewspace_point_tensor_grad[blind_spots] *= opt.occlusion_densify_weight
+            densification_gain = 1.0 + (opt.occlusion_densify_weight - 1.0) * occlusion_score
+            viewspace_point_tensor_grad *= densification_gain.unsqueeze(-1)
         iter_end.record()
 
         with torch.no_grad():
@@ -525,13 +558,20 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 collaborator_count = int(collaborator_visibility.sum())
                 blind_count = int(blind_spots.sum())
                 overlap_count = int(torch.logical_and(ego_visibility, collaborator_visibility).sum())
+                active_scores = occlusion_score[collaborator_visibility]
+                mean_score = float(active_scores.mean()) if active_scores.numel() else 0.0
+                mean_weight = float(collaborator_weight[collaborator_visibility].mean()) \
+                    if collaborator_visibility.any() else 0.0
                 print(f"[ITER {iteration}] visibility ego={ego_count:,}, collab={collaborator_count:,}, "
-                      f"blind={blind_count:,}, overlap={overlap_count:,}")
+                      f"blind={blind_count:,}, overlap={overlap_count:,}, "
+                      f"occ_score={mean_score:.3f}, collab_weight={mean_weight:.3f}")
                 if tb_writer:
                     tb_writer.add_scalar("collaboration/ego_visible", ego_count, iteration)
                     tb_writer.add_scalar("collaboration/collaborator_visible", collaborator_count, iteration)
                     tb_writer.add_scalar("collaboration/ego_blind_spots", blind_count, iteration)
                     tb_writer.add_scalar("collaboration/overlap", overlap_count, iteration)
+                    tb_writer.add_scalar("collaboration/mean_occlusion_score", mean_score, iteration)
+                    tb_writer.add_scalar("collaboration/mean_gradient_weight", mean_weight, iteration)
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
                                           "psnr": f"{psnr_:.{2}f}",
@@ -651,11 +691,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent,
                                           size_threshold, 5, 5, scene.model_path, iteration, stage,
                                           sorted_cams, sorted_boxes,
-                                          blind_spots if opt.occlusion_guided_densification else None)
+                                          torch.logical_and(
+                                              blind_spots, occlusion_score >= opt.occlusion_score_threshold)
+                                          if opt.occlusion_guided_densification else None)
                     else:
                         gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5,
                                           5, scene.model_path, iteration, stage, sorted_cams, sorted_boxes,
-                                          blind_spots if opt.occlusion_guided_densification else None)
+                                          torch.logical_and(
+                                              blind_spots, occlusion_score >= opt.occlusion_score_threshold)
+                                          if opt.occlusion_guided_densification else None)
 
                 prune_start_points = min(2_000_000, max(100_000, int(opt.max_gaussians * 0.8))) \
                     if opt.max_gaussians > 0 else 2_000_000

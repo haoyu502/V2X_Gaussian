@@ -161,6 +161,10 @@ class OptimizationParams(ParamGroup):
         self.collaboration_overlap_weight=0.1
         self.collaboration_blind_weight=1.0
         self.collaboration_network_min_weight=0.1
+        self.adaptive_collaboration=False
+        self.visibility_radius_scale=4.0
+        self.collaboration_max_weight=0.6
+        self.occlusion_score_threshold=0.65
         self.occlusion_guided_densification=False
         self.occlusion_densify_weight=2.0
         self.collaboration_log_interval=250
