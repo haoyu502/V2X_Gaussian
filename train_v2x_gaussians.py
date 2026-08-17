@@ -104,11 +104,42 @@ def setup_file_logging(model_path):
     return log_path
 
 
-def sync_optimizer_gradients(optimizer):
-    """Average every trainable gradient, including dynamically resized Gaussians."""
+GAUSSIAN_PARAMETER_GROUPS = {"xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"}
+
+
+def build_visibility_field(local_visibility, local_radii, local_is_ego, opt):
+    """Build synchronized ego/collaborator visibility and per-Gaussian weights."""
+    if not distributed_enabled() or not opt.selective_collaboration:
+        ones = torch.ones_like(local_radii)
+        return local_visibility, local_visibility, torch.zeros_like(local_visibility), ones
+
+    ego_visibility = local_visibility.to(torch.int32) if local_is_ego else torch.zeros_like(
+        local_visibility, dtype=torch.int32)
+    collaborator_visibility = torch.zeros_like(ego_visibility) if local_is_ego else local_visibility.to(torch.int32)
+    ego_radii = local_radii.clone() if local_is_ego else torch.zeros_like(local_radii)
+    collaborator_radii = torch.zeros_like(local_radii) if local_is_ego else local_radii.clone()
+    for tensor in (ego_visibility, collaborator_visibility, ego_radii, collaborator_radii):
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+
+    ego_visibility = ego_visibility.bool()
+    collaborator_visibility = collaborator_visibility.bool()
+    blind_spots = torch.logical_and(~ego_visibility, collaborator_visibility)
+    overlap = torch.logical_and(ego_visibility, collaborator_visibility)
+    # Projected-radius agreement is a cheap geometric consistency proxy. It only
+    # suppresses redundant overlap; collaborator-only observations retain weight 1.
+    radius_consistency = torch.exp(-torch.abs(torch.log(
+        (collaborator_radii + 1.0) / (ego_radii + 1.0))))
+    collaborator_weight = torch.zeros_like(local_radii)
+    collaborator_weight[blind_spots] = opt.collaboration_blind_weight
+    collaborator_weight[overlap] = opt.collaboration_overlap_weight * radius_consistency[overlap]
+    return ego_visibility, collaborator_visibility, blind_spots, collaborator_weight
+
+
+def sync_optimizer_gradients(optimizer, local_is_ego, local_visibility,
+                             ego_visibility, collaborator_weight, opt):
+    """Synchronize gradients, prioritizing collaborator evidence in ego blind spots."""
     if not distributed_enabled():
         return
-    world_size = dist.get_world_size()
     for group in optimizer.param_groups:
         for parameter in group["params"]:
             if parameter.grad is None:
@@ -116,15 +147,50 @@ def sync_optimizer_gradients(optimizer):
             # Some rasterizer/plane gradients are strided views. NCCL collectives
             # require contiguous storage, so reduce a packed buffer and copy back.
             gradient = parameter.grad.contiguous()
-            dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
-            gradient.div_(world_size)
+            if opt.selective_collaboration and group.get("name") in GAUSSIAN_PARAMETER_GROUPS \
+                    and gradient.shape[0] == ego_visibility.shape[0]:
+                source_weight = ego_visibility.float() if local_is_ego else \
+                    collaborator_weight * local_visibility.float()
+                weight_shape = (source_weight.shape[0],) + (1,) * (gradient.ndim - 1)
+                gradient.mul_(source_weight.reshape(weight_shape))
+                denominator = source_weight.clone()
+                dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+                dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
+                gradient.div_(denominator.clamp_min(1e-8).reshape(weight_shape))
+            else:
+                if opt.selective_collaboration:
+                    if local_is_ego:
+                        scalar_weight = torch.ones((), device=gradient.device)
+                    else:
+                        visible_weights = collaborator_weight[
+                            torch.logical_and(local_visibility, collaborator_weight > 0)]
+                        scalar_weight = visible_weights.mean() if visible_weights.numel() else torch.tensor(
+                            opt.collaboration_network_min_weight, device=gradient.device)
+                        scalar_weight = scalar_weight.clamp_min(opt.collaboration_network_min_weight)
+                    gradient.mul_(scalar_weight)
+                    denominator = scalar_weight.clone()
+                    dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
+                    gradient.div_(denominator.clamp_min(1e-8))
+                else:
+                    dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+                    gradient.div_(dist.get_world_size())
             parameter.grad.copy_(gradient)
 
 
-def sync_densification_inputs(radii, visibility, viewspace_grad):
+def sync_densification_inputs(radii, visibility, viewspace_grad, local_is_ego,
+                              ego_visibility, collaborator_visibility, collaborator_weight, opt):
     if not distributed_enabled():
         return radii, visibility, viewspace_grad
     dist.all_reduce(radii, op=dist.ReduceOp.MAX)
+    if opt.selective_collaboration:
+        point_weight = ego_visibility.float() if local_is_ego else collaborator_weight * visibility.float()
+        weighted_grad = viewspace_grad * point_weight.unsqueeze(-1)
+        denominator = point_weight.clone()
+        dist.all_reduce(weighted_grad, op=dist.ReduceOp.SUM)
+        dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
+        weighted_grad.div_(denominator.clamp_min(1e-8).unsqueeze(-1))
+        return radii, torch.logical_or(ego_visibility, collaborator_visibility), weighted_grad
     visibility_int = visibility.to(torch.int32)
     dist.all_reduce(visibility_int, op=dist.ReduceOp.MAX)
     dist.all_reduce(viewspace_grad, op=dist.ReduceOp.SUM)
@@ -358,10 +424,27 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 seen_views.add(key)
         camera_t = [cam.camera_center / torch.norm(cam.camera_center) for cam in unique_views]
         all_views = unique_views
+        local_is_ego = True
+        local_camera_index = 0
         if distributed_enabled():
-            # A rank owns one camera graph. With four ranks and three V2X cameras,
-            # rank 3 wraps to camera 0; gradients are averaged below.
-            unique_views = [all_views[(distributed_rank() + iteration) % len(all_views)]]
+            if opt.selective_collaboration:
+                ego_indices = [i for i, cam in enumerate(all_views) if cam.uid == opt.ego_camera_uid]
+                if not ego_indices:
+                    raise RuntimeError(f"Ego camera uid {opt.ego_camera_uid} is absent at timestamp "
+                                       f"{all_views[0].time}")
+                collaborator_indices = [i for i, cam in enumerate(all_views) if cam.uid != opt.ego_camera_uid]
+                if distributed_rank() == 0 or not collaborator_indices:
+                    local_camera_index = ego_indices[0]
+                    local_is_ego = True
+                else:
+                    local_camera_index = collaborator_indices[
+                        (distributed_rank() - 1 + iteration) % len(collaborator_indices)]
+                    local_is_ego = False
+            else:
+                # Baseline data parallelism: one camera graph per rank.
+                local_camera_index = (distributed_rank() + iteration) % len(all_views)
+                local_is_ego = all_views[local_camera_index].uid == opt.ego_camera_uid
+            unique_views = [all_views[local_camera_index]]
 
         loss_values = []
         l1_values = []
@@ -413,9 +496,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         radii = torch.cat(radii_list, 0).max(dim=0).values
         visibility_filter = torch.cat(visibility_filter_list, 0).any(dim=0)
         viewspace_point_tensor_grad = torch.stack(viewspace_grads).sum(dim=0)
-        sync_optimizer_gradients(gaussians.optimizer)
+        ego_visibility, collaborator_visibility, blind_spots, collaborator_weight = build_visibility_field(
+            visibility_filter, radii, local_is_ego, opt)
+        sync_optimizer_gradients(gaussians.optimizer, local_is_ego, visibility_filter,
+                                 ego_visibility, collaborator_weight, opt)
         radii, visibility_filter, viewspace_point_tensor_grad = sync_densification_inputs(
-            radii, visibility_filter, viewspace_point_tensor_grad)
+            radii, visibility_filter, viewspace_point_tensor_grad, local_is_ego,
+            ego_visibility, collaborator_visibility, collaborator_weight, opt)
+        if opt.occlusion_guided_densification:
+            viewspace_point_tensor_grad[blind_spots] *= opt.occlusion_densify_weight
         iter_end.record()
 
         with torch.no_grad():
@@ -428,6 +517,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 reserved = torch.cuda.memory_reserved() / (1024 ** 3)
                 print(f"\n[ITER {iteration}] GPU memory {allocated:.2f} GiB allocated, "
                       f"{reserved:.2f} GiB reserved; Gaussians {total_point:,}")
+            if distributed_rank() == 0 and opt.selective_collaboration and \
+                    opt.collaboration_log_interval > 0 and iteration % opt.collaboration_log_interval == 0:
+                ego_count = int(ego_visibility.sum())
+                collaborator_count = int(collaborator_visibility.sum())
+                blind_count = int(blind_spots.sum())
+                overlap_count = int(torch.logical_and(ego_visibility, collaborator_visibility).sum())
+                print(f"[ITER {iteration}] visibility ego={ego_count:,}, collab={collaborator_count:,}, "
+                      f"blind={blind_count:,}, overlap={overlap_count:,}")
+                if tb_writer:
+                    tb_writer.add_scalar("collaboration/ego_visible", ego_count, iteration)
+                    tb_writer.add_scalar("collaboration/collaborator_visible", collaborator_count, iteration)
+                    tb_writer.add_scalar("collaboration/ego_blind_spots", blind_count, iteration)
+                    tb_writer.add_scalar("collaboration/overlap", overlap_count, iteration)
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
                                           "psnr": f"{psnr_:.{2}f}",
@@ -529,9 +631,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         # Gather each rank's highest-error image region. Every rank
                         # then performs the same V2X cross-ray densification using
                         # the same ordered camera/box records.
-                        local_camera = (distributed_rank() + iteration) % len(all_views)
                         local_record = torch.tensor(
-                            [local_camera, float(losses[sorted_indices[0]]), *sorted_boxes[0]],
+                            [local_camera_index, float(losses[sorted_indices[0]]), *sorted_boxes[0]],
                             dtype=torch.float64, device=gaussians.get_xyz.device)
                         gathered = [torch.zeros_like(local_record) for _ in range(dist.get_world_size())]
                         dist.all_gather(gathered, local_record)
@@ -547,10 +648,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         torch.manual_seed(6666 + iteration)
                         gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent,
                                           size_threshold, 5, 5, scene.model_path, iteration, stage,
-                                          sorted_cams, sorted_boxes)
+                                          sorted_cams, sorted_boxes,
+                                          blind_spots if opt.occlusion_guided_densification else None)
                     else:
                         gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5,
-                                          5, scene.model_path, iteration, stage, sorted_cams, sorted_boxes)
+                                          5, scene.model_path, iteration, stage, sorted_cams, sorted_boxes,
+                                          blind_spots if opt.occlusion_guided_densification else None)
 
                 prune_start_points = min(2_000_000, max(100_000, int(opt.max_gaussians * 0.8))) \
                     if opt.max_gaussians > 0 else 2_000_000

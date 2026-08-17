@@ -108,6 +108,25 @@ Once the example scene is extracted, execute the following command to train the 
 python train_v2x_gaussians.py -s "path_to_example_scene"  --port 6017 --expname "Experiment_Name" --configs arguments/multi_agents/v2x_gaussian.py  # change data path.
 ```
 
+### Occlusion-aware selective collaboration (2/4 GPUs)
+
+The experimental configuration fixes rank 0 to the vehicle/ego camera (UID 2),
+uses the remaining ranks for infrastructure views, selectively fuses gradients in
+ego blind spots, and restricts forced cross-ray densification to those blind spots.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  train_v2x_gaussians.py \
+  -s data/pedestrian_crossing \
+  --expname pedestrian_crossing_occlusion_2gpu \
+  --configs arguments/multi_agents/v2x_gaussian_occlusion.py
+```
+
+For four GPUs, change `CUDA_VISIBLE_DEVICES` to `0,1,2,3` and
+`--nproc_per_node` to `4`. The selective-gradient-only ablation uses
+`arguments/multi_agents/v2x_gaussian_selective_gradient.py`; the 4090 baseline
+remains `arguments/multi_agents/v2x_gaussian_4090.py`.
+
 
 
 ## Rendering

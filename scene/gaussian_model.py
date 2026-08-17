@@ -546,7 +546,7 @@ class GaussianModel:
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent, box3ds, density_threshold=20,
                           displacement_scale=20, model_path=None, iteration=None, stage=None,
-                          max_new_points=0):
+                          max_new_points=0, collaboration_mask=None):
 
         # Extract points that are in my agent intersecting region
         # the gradient condition
@@ -575,6 +575,12 @@ class GaussianModel:
         
         Subjecting Masked points for densification
         """
+        if collaboration_mask is not None:
+            if collaboration_mask.shape[0] != mask.shape[0]:
+                raise ValueError("Collaboration mask and Gaussian count are out of sync")
+            # Cross-ray regions may be large. Only force clones where collaborators
+            # see geometry that the ego camera cannot currently observe.
+            mask = torch.logical_and(mask, collaboration_mask)
         selected_pts_mask = torch.logical_or(selected_pts_mask, mask)
         selected_pts_mask = self._limit_mask(
             selected_pts_mask, torch.norm(grads, dim=-1), max_new_points)
@@ -705,7 +711,8 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def densify(self, max_grad, min_opacity, extent, max_screen_size, density_threshold, displacement_scale,
-                model_path=None, iteration=None, stage=None, cams=None, boxes=None):
+                model_path=None, iteration=None, stage=None, cams=None, boxes=None,
+                collaboration_mask=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -790,7 +797,7 @@ class GaussianModel:
             budget = min(budget, remaining) if budget > 0 else remaining
         clone_budget = budget // 2 if budget > 0 else 0
         self.densify_and_clone(grads, max_grad, extent, box3ds, density_threshold, displacement_scale, model_path,
-                               iteration, stage, clone_budget)
+                               iteration, stage, clone_budget, collaboration_mask)
         if budget > 0:
             budget = min(budget - clone_budget,
                          max(0, self.max_gaussians - self.get_xyz.shape[0]) if self.max_gaussians > 0 else budget)

@@ -154,6 +154,16 @@ class OptimizationParams(ParamGroup):
         self.max_gaussians=0
         self.max_densify_points=0
         self.memory_log_interval=500
+        # Ego-centric selective V2X collaboration. Camera uid 2 is the vehicle
+        # camera in the released V2X datasets.
+        self.selective_collaboration=False
+        self.ego_camera_uid=2
+        self.collaboration_overlap_weight=0.1
+        self.collaboration_blind_weight=1.0
+        self.collaboration_network_min_weight=0.1
+        self.occlusion_guided_densification=False
+        self.occlusion_densify_weight=2.0
+        self.collaboration_log_interval=250
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
