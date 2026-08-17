@@ -110,7 +110,7 @@ GAUSSIAN_PARAMETER_GROUPS = {"xyz", "f_dc", "f_rest", "opacity", "scaling", "rot
 def build_visibility_field(local_visibility, local_radii, local_is_ego, opt):
     """Build synchronized ego/collaborator visibility and per-Gaussian weights."""
     if not distributed_enabled() or not opt.selective_collaboration:
-        ones = torch.ones_like(local_radii)
+        ones = torch.ones_like(local_radii, dtype=torch.float32)
         return local_visibility, local_visibility, torch.zeros_like(local_visibility), ones
 
     ego_visibility = local_visibility.to(torch.int32) if local_is_ego else torch.zeros_like(
@@ -129,7 +129,9 @@ def build_visibility_field(local_visibility, local_radii, local_is_ego, opt):
     # suppresses redundant overlap; collaborator-only observations retain weight 1.
     radius_consistency = torch.exp(-torch.abs(torch.log(
         (collaborator_radii + 1.0) / (ego_radii + 1.0))))
-    collaborator_weight = torch.zeros_like(local_radii)
+    # The CUDA rasterizer may return integer radii. Collaboration weights must
+    # remain floating point because overlap consistency is fractional.
+    collaborator_weight = torch.zeros_like(local_radii, dtype=torch.float32)
     collaborator_weight[blind_spots] = opt.collaboration_blind_weight
     collaborator_weight[overlap] = opt.collaboration_overlap_weight * radius_consistency[overlap]
     return ego_visibility, collaborator_visibility, blind_spots, collaborator_weight
