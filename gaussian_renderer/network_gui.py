@@ -21,18 +21,30 @@ port = 6009
 conn = None
 addr = None
 
-listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener = None
 
 def init(wish_host, wish_port):
     global host, port, listener
     host = wish_host
     port = wish_port
-    listener.bind((host, port))
-    listener.listen()
-    listener.settimeout(0)
+    candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        candidate.bind((host, port))
+        candidate.listen()
+        candidate.settimeout(0)
+        listener = candidate
+        return True
+    except OSError as error:
+        candidate.close()
+        listener = None
+        print(f"[warning] GUI disabled: cannot listen on {host}:{port}: {error}")
+        return False
 
 def try_connect():
     global conn, addr, listener
+    if listener is None:
+        return
     try:
         conn, addr = listener.accept()
         print(f"\nConnected by {addr}")
