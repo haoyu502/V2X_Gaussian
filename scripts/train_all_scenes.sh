@@ -9,6 +9,7 @@ config="${CONFIG:-arguments/multi_agents/v2x_gaussian_4090.py}"
 experiment_suffix="${EXP_SUFFIX:-2x4090}"
 base_port="${BASE_PORT:-6010}"
 final_iteration="${ITERATION:-20000}"
+max_retries="${MAX_RETRIES:-2}"
 
 cd "${repo_dir}"
 
@@ -45,16 +46,37 @@ for index in "${!scenes[@]}"; do
         exit 1
     fi
 
-    echo "[train $((index + 1))/${#scenes[@]}] ${scene} -> output/${experiment}"
-    CUDA_VISIBLE_DEVICES="${gpu_list}" torchrun \
-        --standalone \
-        --nproc_per_node="${gpu_count}" \
-        train_v2x_gaussians.py \
-        -s "${scene_dir}" \
-        --expname "${experiment}" \
-        --configs "${config}" \
-        --port "${port}" \
-        --checkpoint_iterations 2500 5000 10000 15000 "${final_iteration}"
+    attempt=1
+    while true; do
+        resume_args=()
+        latest_checkpoint="$(find "${output_dir}" -maxdepth 1 -type f -name 'chkpnt_fine_*.pth' \
+            -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)"
+        if [[ -n "${latest_checkpoint}" ]]; then
+            resume_args=(--start_checkpoint "${output_dir}/${latest_checkpoint}")
+            echo "[resume] ${scene}: ${latest_checkpoint}"
+        fi
+
+        echo "[train $((index + 1))/${#scenes[@]} attempt ${attempt}/${max_retries}] " \
+             "${scene} -> output/${experiment}"
+        if CUDA_VISIBLE_DEVICES="${gpu_list}" torchrun \
+            --standalone \
+            --nproc_per_node="${gpu_count}" \
+            train_v2x_gaussians.py \
+            -s "${scene_dir}" \
+            --expname "${experiment}" \
+            --configs "${config}" \
+            --port "${port}" \
+            --checkpoint_iterations 2500 5000 10000 15000 "${final_iteration}" \
+            "${resume_args[@]}"; then
+            break
+        fi
+        if (( attempt >= max_retries )); then
+            echo "[error] ${scene}: failed after ${max_retries} attempts" >&2
+            exit 1
+        fi
+        attempt=$((attempt + 1))
+        echo "[retry] ${scene}: restarting from the newest fine checkpoint" >&2
+    done
 done
 
 echo "All scenes completed."

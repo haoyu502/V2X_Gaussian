@@ -151,11 +151,24 @@ def build_visibility_field(local_visibility, local_radii, local_is_ego, opt):
     return ego_visibility, collaborator_visibility, blind_spots, collaborator_weight, occlusion_score
 
 
+def sync_collaborator_count(local_is_ego, local_visibility, collaborator_weight):
+    """Count valid collaborator contributors once per iteration."""
+    if not distributed_enabled():
+        return torch.ones_like(collaborator_weight)
+    if local_is_ego:
+        count = torch.zeros_like(collaborator_weight)
+    else:
+        count = torch.logical_and(local_visibility, collaborator_weight > 0).float()
+    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    return count
+
+
 def sync_optimizer_gradients(optimizer, local_is_ego, local_visibility,
-                             ego_visibility, collaborator_weight, opt):
+                             ego_visibility, collaborator_weight, collaborator_count, opt):
     """Synchronize gradients, prioritizing collaborator evidence in ego blind spots."""
     if not distributed_enabled():
         return
+    network_gradients = []
     for group in optimizer.param_groups:
         for parameter in group["params"]:
             if parameter.grad is None:
@@ -169,42 +182,51 @@ def sync_optimizer_gradients(optimizer, local_is_ego, local_visibility,
                 if local_is_ego:
                     ego_gradient = gradient * ego_visibility.float().reshape(point_shape)
                     collaborator_gradient = torch.zeros_like(gradient)
-                    collaborator_count = torch.zeros_like(collaborator_weight)
                 else:
                     ego_gradient = torch.zeros_like(gradient)
                     local_collaborator = local_visibility.float()
                     collaborator_gradient = gradient * (
                         collaborator_weight * local_collaborator).reshape(point_shape)
-                    collaborator_count = torch.logical_and(
-                        local_visibility, collaborator_weight > 0).float()
                 dist.all_reduce(ego_gradient, op=dist.ReduceOp.SUM)
                 dist.all_reduce(collaborator_gradient, op=dist.ReduceOp.SUM)
-                dist.all_reduce(collaborator_count, op=dist.ReduceOp.SUM)
                 collaborator_gradient.div_(collaborator_count.clamp_min(1.0).reshape(point_shape))
                 gradient = ego_gradient + collaborator_gradient
+                parameter.grad.copy_(gradient)
             else:
-                if opt.selective_collaboration:
-                    if local_is_ego:
-                        scalar_weight = torch.ones((), device=gradient.device)
-                    else:
-                        visible_weights = collaborator_weight[
-                            torch.logical_and(local_visibility, collaborator_weight > 0)]
-                        scalar_weight = visible_weights.mean() if visible_weights.numel() else torch.tensor(
-                            opt.collaboration_network_min_weight, device=gradient.device)
-                        scalar_weight = scalar_weight.clamp_min(opt.collaboration_network_min_weight)
-                    gradient.mul_(scalar_weight)
-                    denominator = scalar_weight.clone()
-                    dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
-                    gradient.div_(denominator.clamp_min(1e-8))
-                else:
-                    dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
-                    gradient.div_(dist.get_world_size())
-            parameter.grad.copy_(gradient)
+                network_gradients.append((parameter, gradient))
+
+    # Deformation/grid networks contain many small parameters. Reducing each one
+    # separately produced ~160 collectives per iteration and eventually stalled
+    # NCCL on long 2M-Gaussian runs. Pack them into one collective instead.
+    if network_gradients:
+        packed = torch.cat([gradient.reshape(-1) for _, gradient in network_gradients])
+        if opt.selective_collaboration:
+            if local_is_ego:
+                scalar_weight = torch.ones((), device=packed.device)
+            else:
+                visible_weights = collaborator_weight[
+                    torch.logical_and(local_visibility, collaborator_weight > 0)]
+                scalar_weight = visible_weights.mean() if visible_weights.numel() else torch.tensor(
+                    opt.collaboration_network_min_weight, device=packed.device)
+                scalar_weight = scalar_weight.clamp_min(opt.collaboration_network_min_weight)
+            packed.mul_(scalar_weight)
+            denominator = scalar_weight.clone()
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            dist.all_reduce(denominator, op=dist.ReduceOp.SUM)
+            packed.div_(denominator.clamp_min(1e-8))
+        else:
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            packed.div_(dist.get_world_size())
+        offset = 0
+        for parameter, gradient in network_gradients:
+            numel = gradient.numel()
+            parameter.grad.copy_(packed[offset:offset + numel].view_as(gradient))
+            offset += numel
 
 
 def sync_densification_inputs(radii, visibility, viewspace_grad, local_is_ego,
-                              ego_visibility, collaborator_visibility, collaborator_weight, opt):
+                              ego_visibility, collaborator_visibility, collaborator_weight,
+                              collaborator_count, opt):
     if not distributed_enabled():
         return radii, visibility, viewspace_grad
     dist.all_reduce(radii, op=dist.ReduceOp.MAX)
@@ -212,15 +234,12 @@ def sync_densification_inputs(radii, visibility, viewspace_grad, local_is_ego,
         if local_is_ego:
             ego_gradient = viewspace_grad * ego_visibility.float().unsqueeze(-1)
             collaborator_gradient = torch.zeros_like(viewspace_grad)
-            collaborator_count = torch.zeros_like(collaborator_weight)
         else:
             ego_gradient = torch.zeros_like(viewspace_grad)
             collaborator_gradient = viewspace_grad * (
                 collaborator_weight * visibility.float()).unsqueeze(-1)
-            collaborator_count = torch.logical_and(visibility, collaborator_weight > 0).float()
         dist.all_reduce(ego_gradient, op=dist.ReduceOp.SUM)
         dist.all_reduce(collaborator_gradient, op=dist.ReduceOp.SUM)
-        dist.all_reduce(collaborator_count, op=dist.ReduceOp.SUM)
         collaborator_gradient.div_(collaborator_count.clamp_min(1.0).unsqueeze(-1))
         combined_gradient = ego_gradient + collaborator_gradient
         return radii, torch.logical_or(ego_visibility, collaborator_visibility), combined_gradient
@@ -532,11 +551,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         ego_visibility, collaborator_visibility, blind_spots, collaborator_weight, occlusion_score = \
             build_visibility_field(
                 visibility_filter, radii, local_is_ego, opt)
+        collaborator_count = sync_collaborator_count(
+            local_is_ego, visibility_filter, collaborator_weight)
         sync_optimizer_gradients(gaussians.optimizer, local_is_ego, visibility_filter,
-                                 ego_visibility, collaborator_weight, opt)
+                                 ego_visibility, collaborator_weight, collaborator_count, opt)
         radii, visibility_filter, viewspace_point_tensor_grad = sync_densification_inputs(
             radii, visibility_filter, viewspace_point_tensor_grad, local_is_ego,
-            ego_visibility, collaborator_visibility, collaborator_weight, opt)
+            ego_visibility, collaborator_visibility, collaborator_weight, collaborator_count, opt)
         if opt.occlusion_guided_densification:
             densification_gain = 1.0 + (opt.occlusion_densify_weight - 1.0) * occlusion_score
             viewspace_point_tensor_grad *= densification_gain.unsqueeze(-1)
