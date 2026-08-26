@@ -167,6 +167,13 @@ python scripts/run_full_pipeline.py --gpus 0,1,2,3 \
   --suffix residual_enhancement_050_4x4090
 ```
 
+To run the remaining E2 (residual 0.50) and E3 (fair four-GPU baseline)
+sequentially with one restart-safe command:
+
+```bash
+bash scripts/run_e2_e3.sh 0,1,2,3
+```
+
 
 
 ## Rendering
