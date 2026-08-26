@@ -168,6 +168,12 @@ class OptimizationParams(ParamGroup):
         self.occlusion_guided_densification=False
         self.occlusion_densify_weight=2.0
         self.collaboration_log_interval=250
+        # V3: preserve the original V2X gradient/densification path and add a
+        # separately scheduled collaborator residual on Gaussian parameters.
+        self.residual_collaboration=False
+        self.collaboration_enhancement=0.25
+        self.collaboration_ramp_start=2000
+        self.collaboration_ramp_end=4000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

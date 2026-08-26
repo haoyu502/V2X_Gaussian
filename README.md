@@ -149,6 +149,24 @@ v1 outputs remain untouched, for example:
 python scripts/run_full_pipeline.py --gpus 0,1,4,5 --suffix adaptive_occlusion_4x4090
 ```
 
+The v3 residual-enhancement profile is now the one-command default. Unlike v1/v2,
+it keeps the original V2X all-rank gradient and densification statistics, then
+adds reliable collaborator evidence as a Gaussian-only residual. The residual is
+disabled during coarse training and fine iterations 0--2000, linearly ramps up
+from 2000--4000, and reaches 0.25 afterwards:
+
+```bash
+python scripts/run_full_pipeline.py --gpus 0,1,2,3
+```
+
+The stronger 0.50 ablation can be run without overwriting E1:
+
+```bash
+python scripts/run_full_pipeline.py --gpus 0,1,2,3 \
+  --config arguments/multi_agents/v2x_gaussian_residual_enhancement_050.py \
+  --suffix residual_enhancement_050_4x4090
+```
+
 
 
 ## Rendering

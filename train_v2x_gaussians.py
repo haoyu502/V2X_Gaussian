@@ -163,8 +163,20 @@ def sync_collaborator_count(local_is_ego, local_visibility, collaborator_weight)
     return count
 
 
+def collaboration_ramp(stage, iteration, opt):
+    """Return the V3 residual schedule without changing the baseline path."""
+    if not opt.residual_collaboration:
+        return 1.0
+    if stage != "fine":
+        return 0.0
+    start = int(opt.collaboration_ramp_start)
+    end = max(int(opt.collaboration_ramp_end), start + 1)
+    return max(0.0, min(1.0, (iteration - start) / float(end - start)))
+
+
 def sync_optimizer_gradients(optimizer, local_is_ego, local_visibility,
-                             ego_visibility, collaborator_weight, collaborator_count, opt):
+                             ego_visibility, collaborator_weight, collaborator_count,
+                             enhancement_strength, opt):
     """Synchronize gradients, prioritizing collaborator evidence in ego blind spots."""
     if not distributed_enabled():
         return
@@ -176,8 +188,26 @@ def sync_optimizer_gradients(optimizer, local_is_ego, local_visibility,
             # Some rasterizer/plane gradients are strided views. NCCL collectives
             # require contiguous storage, so reduce a packed buffer and copy back.
             gradient = parameter.grad.contiguous()
-            if opt.selective_collaboration and group.get("name") in GAUSSIAN_PARAMETER_GROUPS \
-                    and gradient.shape[0] == ego_visibility.shape[0]:
+            is_gaussian = group.get("name") in GAUSSIAN_PARAMETER_GROUPS \
+                and gradient.shape[0] == ego_visibility.shape[0]
+            if opt.residual_collaboration and is_gaussian:
+                # Exact original V2X/DDP gradient is always retained. The
+                # uncertainty-aware collaborator term can only enhance it.
+                baseline_gradient = gradient.clone()
+                dist.all_reduce(baseline_gradient, op=dist.ReduceOp.SUM)
+                baseline_gradient.div_(dist.get_world_size())
+                if local_is_ego:
+                    collaborator_gradient = torch.zeros_like(gradient)
+                else:
+                    point_shape = (ego_visibility.shape[0],) + (1,) * (gradient.ndim - 1)
+                    collaborator_gradient = gradient * (
+                        collaborator_weight * local_visibility.float()).reshape(point_shape)
+                dist.all_reduce(collaborator_gradient, op=dist.ReduceOp.SUM)
+                point_shape = (ego_visibility.shape[0],) + (1,) * (gradient.ndim - 1)
+                collaborator_gradient.div_(collaborator_count.clamp_min(1.0).reshape(point_shape))
+                parameter.grad.copy_(baseline_gradient.add_(
+                    collaborator_gradient, alpha=enhancement_strength))
+            elif opt.selective_collaboration and is_gaussian:
                 point_shape = (ego_visibility.shape[0],) + (1,) * (gradient.ndim - 1)
                 if local_is_ego:
                     ego_gradient = gradient * ego_visibility.float().reshape(point_shape)
@@ -200,7 +230,12 @@ def sync_optimizer_gradients(optimizer, local_is_ego, local_visibility,
     # NCCL on long 2M-Gaussian runs. Pack them into one collective instead.
     if network_gradients:
         packed = torch.cat([gradient.reshape(-1) for _, gradient in network_gradients])
-        if opt.selective_collaboration:
+        if opt.residual_collaboration:
+            # The residual is deliberately point-local. Networks retain the
+            # exact baseline all-rank average to avoid a global distribution shift.
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            packed.div_(dist.get_world_size())
+        elif opt.selective_collaboration:
             if local_is_ego:
                 scalar_weight = torch.ones((), device=packed.device)
             else:
@@ -230,6 +265,14 @@ def sync_densification_inputs(radii, visibility, viewspace_grad, local_is_ego,
     if not distributed_enabled():
         return radii, visibility, viewspace_grad
     dist.all_reduce(radii, op=dist.ReduceOp.MAX)
+    if opt.residual_collaboration:
+        # Preserve the original densification statistics in V3. Selective
+        # weighting here caused the V2 point distribution to collapse.
+        visibility_int = visibility.to(torch.int32)
+        dist.all_reduce(visibility_int, op=dist.ReduceOp.MAX)
+        dist.all_reduce(viewspace_grad, op=dist.ReduceOp.SUM)
+        viewspace_grad.div_(dist.get_world_size())
+        return radii, visibility_int.bool(), viewspace_grad
     if opt.selective_collaboration:
         if local_is_ego:
             ego_gradient = viewspace_grad * ego_visibility.float().unsqueeze(-1)
@@ -553,8 +596,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 visibility_filter, radii, local_is_ego, opt)
         collaborator_count = sync_collaborator_count(
             local_is_ego, visibility_filter, collaborator_weight)
+        ramp = collaboration_ramp(stage, iteration, opt)
+        enhancement_strength = float(opt.collaboration_enhancement) * ramp
         sync_optimizer_gradients(gaussians.optimizer, local_is_ego, visibility_filter,
-                                 ego_visibility, collaborator_weight, collaborator_count, opt)
+                                 ego_visibility, collaborator_weight, collaborator_count,
+                                 enhancement_strength, opt)
         radii, visibility_filter, viewspace_point_tensor_grad = sync_densification_inputs(
             radii, visibility_filter, viewspace_point_tensor_grad, local_is_ego,
             ego_visibility, collaborator_visibility, collaborator_weight, collaborator_count, opt)
@@ -583,9 +629,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 mean_score = float(active_scores.mean()) if active_scores.numel() else 0.0
                 mean_weight = float(collaborator_weight[collaborator_visibility].mean()) \
                     if collaborator_visibility.any() else 0.0
+                if active_scores.numel():
+                    score_q10, score_q50, score_q90 = [float(value) for value in
+                        torch.quantile(active_scores.float(), torch.tensor(
+                            [0.1, 0.5, 0.9], device=active_scores.device))]
+                    low_ratio = float((active_scores < 0.2).float().mean())
+                    high_ratio = float((active_scores > 0.8).float().mean())
+                else:
+                    score_q10 = score_q50 = score_q90 = low_ratio = high_ratio = 0.0
                 print(f"[ITER {iteration}] visibility ego={ego_count:,}, collab={collaborator_count:,}, "
                       f"blind={blind_count:,}, overlap={overlap_count:,}, "
-                      f"occ_score={mean_score:.3f}, collab_weight={mean_weight:.3f}")
+                      f"occ_score={mean_score:.3f} (q10/50/90={score_q10:.3f}/{score_q50:.3f}/{score_q90:.3f}), "
+                      f"low/high={low_ratio:.3f}/{high_ratio:.3f}, collab_weight={mean_weight:.3f}, "
+                      f"residual_strength={enhancement_strength:.3f}")
                 if tb_writer:
                     tb_writer.add_scalar("collaboration/ego_visible", ego_count, iteration)
                     tb_writer.add_scalar("collaboration/collaborator_visible", collaborator_count, iteration)
@@ -593,6 +649,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     tb_writer.add_scalar("collaboration/overlap", overlap_count, iteration)
                     tb_writer.add_scalar("collaboration/mean_occlusion_score", mean_score, iteration)
                     tb_writer.add_scalar("collaboration/mean_gradient_weight", mean_weight, iteration)
+                    tb_writer.add_scalar("collaboration/occlusion_q10", score_q10, iteration)
+                    tb_writer.add_scalar("collaboration/occlusion_q50", score_q50, iteration)
+                    tb_writer.add_scalar("collaboration/occlusion_q90", score_q90, iteration)
+                    tb_writer.add_scalar("collaboration/low_score_ratio", low_ratio, iteration)
+                    tb_writer.add_scalar("collaboration/high_score_ratio", high_ratio, iteration)
+                    tb_writer.add_scalar("collaboration/residual_strength", enhancement_strength, iteration)
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
                                           "psnr": f"{psnr_:.{2}f}",
