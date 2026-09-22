@@ -46,6 +46,9 @@ Note: The synthesized view may appear incomplete or discontinuous due to the lim
 
 ## Installation
 
+For a reproducible CUDA 12.4 container that can be exported and uploaded to a
+GPU cloud server, see [Docker deployment](docs/docker_deployment.md).
+
 <details> <summary>Clone this repository</summary>
 
 ```bash
