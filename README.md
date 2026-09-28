@@ -63,6 +63,15 @@ pip install -r requirements.txt
 pip install submodules/depth-diff-gaussian-rasterization
 pip install submodules/simple-knn
 ```
+
+Alternatively, reproduce the tested CUDA 12.4 / PyTorch 2.4 environment and
+compile both local CUDA extensions with one command:
+
+```bash
+bash scripts/create_conda_environment.sh
+```
+
+The portable environment specification is [`environment.yml`](environment.yml).
 </details>
 
 <details> <summary>Prepare V2X-Gaussians On-The-Road (V2X-GOTR) Dataset</summary>

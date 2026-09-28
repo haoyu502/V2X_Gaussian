@@ -1,0 +1,31 @@
+name: v2x_gaussian
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.9
+  - pip
+  - setuptools=60.2.0
+  - wheel
+  - ninja
+  - pytorch=2.4.0
+  - torchvision=0.19.0
+  - torchaudio=2.4.0
+  - pytorch-cuda=12.4
+  - pip:
+      - numpy==2.0.2
+      - mmcv==1.6.0
+      - matplotlib==3.9.4
+      - argparse==1.4.0
+      - lpips==0.1.4
+      - open3d==0.18.0
+      - opencv-python==5.0.0.93
+      - plyfile==1.1.3
+      - pytorch-msssim==1.0.0
+      - kornia==0.8.2
+      - imageio[ffmpeg]==2.37.2
+
