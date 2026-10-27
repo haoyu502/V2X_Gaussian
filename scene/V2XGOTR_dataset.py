@@ -736,6 +736,11 @@ class V2XGOTR_Dataset(Dataset):
     def __len__(self):
         return len(self.image_paths)
 
+    def scene_graph_metadata(self, index, time_origin_ns):
+        """Real sensor time without changing the baseline's normalized time."""
+        from scene.scene_graph.timestamps import camera_metadata
+        return camera_metadata(self.image_paths[index], time_origin_ns)
+
     def __getitem__(self, index):
         img = Image.open(self.image_paths[index])
         img = img.resize(self.img_wh, Image.LANCZOS)

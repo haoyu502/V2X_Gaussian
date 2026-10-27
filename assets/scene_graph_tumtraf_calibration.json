@@ -1,0 +1,22 @@
+{
+  "world_frame": "s110_lidar_ouster_south",
+  "source": "https://github.com/tum-traffic-dataset/coopdet3d/blob/master/tools/data_converter/tumtraf_v2x_converter.py",
+  "description": "Daytime projection matrices from the dataset authors' converter. Vehicle projection uses the vehicle LiDAR frame; compose the per-frame vehicle-to-infrastructure inverse before decomposing. Validate overlays on each sequence before benchmarking.",
+  "projections": {
+    "s110_camera_basler_south1_8mm": [
+      [1279.275240545117, -862.9254609474538, -443.6558546306608, -16164.33175985643],
+      [-57.00793327192514, -67.92432779187584, -1461.785310749125, -806.9258947569469],
+      [0.7901272773742676, 0.3428181111812592, -0.508108913898468, 3.678680419921875]
+    ],
+    "s110_camera_basler_south2_8mm": [
+      [1546.63215008, -436.92407115, -295.58362676, 1319.79271737],
+      [93.20805656, 47.90351592, -1482.13403199, 687.84781276],
+      [0.73326062, 0.59708904, -0.32528854, -1.30114325]
+    ],
+    "vehicle_camera_basler_16mm": [
+      [1019.929965441548, -2613.286262078907, 184.6794570200418, 370.7180273597151],
+      [589.8963703919744, -24.09642935106967, -2623.908527352794, -139.3143336725661],
+      [0.9841844439506531, 0.1303769648075104, 0.1199281811714172, -0.1664766669273376]
+    ]
+  }
+}

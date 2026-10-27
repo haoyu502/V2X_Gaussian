@@ -9,17 +9,24 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from __future__ import annotations
+
 import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
-from scene.dataset import V2XGOTR
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from torch.utils.data import Dataset
 
+
+def __getattr__(name):
+    # Keep the original public import while allowing CPU-only scene-graph tools
+    # to run without importing simple-knn, Open3D and the deformation network.
+    if name == "GaussianModel":
+        from scene.gaussian_model import GaussianModel
+        return GaussianModel
+    raise AttributeError(name)
 
 
 class Scene:
@@ -30,6 +37,9 @@ class Scene:
         """
         :param path: Path to colmap scene main folder or V2XGOTR dataset.
         """
+        from scene.dataset_readers import sceneLoadTypeCallbacks
+        from scene.dataset import V2XGOTR
+
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians

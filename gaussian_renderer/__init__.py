@@ -9,12 +9,21 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from __future__ import annotations
+
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
+
+
+def __getattr__(name):
+    if name == "GaussianModel":
+        from scene.gaussian_model import GaussianModel
+        return GaussianModel
+    raise AttributeError(name)
+
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None):
     """
     Render the scene. 
@@ -22,6 +31,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     Background tensor (bg_color) must be on GPU!
     """
  
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
